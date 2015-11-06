@@ -722,6 +722,14 @@ videojs.Hls.prototype.findCurrentBuffered_ = function() {
     currentTime = tech.currentTime();
 
   if (buffered && buffered.length) {
+    // XXX - Current time may be less than the start of the first interval.
+    // If this is the case, assume it is actually in said interval.
+    if (currentTime <= buffered.start(0)) {
+      ranges = videojs.createTimeRanges(buffered.start(0), buffered.end(0));
+      ranges.indexOf = 0;
+      return ranges;
+    }
+
     // Search for a range containing the play-head
     for (i = 0; i < buffered.length; i++) {
       if (buffered.start(i) <= currentTime &&
