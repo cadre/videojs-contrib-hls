@@ -1,4 +1,4 @@
-/*! videojs-contrib-hls - v1.1.0 - 2015-11-06
+/*! videojs-contrib-hls - v1.2.0 - 2015-11-09
 * Copyright (c) 2015 Brightcove; Licensed  */
 /*! videojs-contrib-media-sources - v2.0.2 - 2015-11-02
 * Copyright (c) 2015 Brightcove; Licensed  */
@@ -4075,39 +4075,29 @@ videojs.Hls.prototype.setupSourceBuffer_ = function() {
     var
       segmentInfo = this.pendingSegment_,
       segment,
+      segments,
       playlist,
       currentMediaIndex,
       currentBuffered,
       timelineUpdates;
 
-    // stop here if the update errored or was aborted
-    if (!segmentInfo) {
-      return;
-    }
-
     this.pendingSegment_ = null;
 
-    // if we've buffered to the end of the video, let the MediaSource know
-    currentBuffered = this.findCurrentBuffered_();
-    if (currentBuffered.length &&
-        this.duration() === currentBuffered.end(0) &&
-        this.mediaSource.readyState === 'open') {
-      this.mediaSource.endOfStream();
-    }
-
     // stop here if the update errored or was aborted
     if (!segmentInfo) {
       return;
     }
+
+    playlist = this.playlists.media();
+    segments = playlist.segments;
+    currentMediaIndex = segmentInfo.mediaIndex + (segmentInfo.mediaSequence - playlist.mediaSequence);
+    currentBuffered = this.findCurrentBuffered_();
 
     // if we switched renditions don't try to add segment timeline
     // information to the playlist
     if (segmentInfo.playlist.uri !== this.playlists.media().uri) {
       return this.fillBuffer();
     }
-
-    playlist = this.playlists.media();
-    currentMediaIndex = segmentInfo.mediaIndex + (segmentInfo.mediaSequence - playlist.mediaSequence);
 
     // annotate the segment with any start and end time information
     // added by the media processing
@@ -4118,14 +4108,20 @@ videojs.Hls.prototype.setupSourceBuffer_ = function() {
 
     timelineUpdates.forEach(function (update) {
       if (segment) {
-        if (update.start !== undefined) {
-          segment.start = update.start;
-        }
         if (update.end !== undefined) {
           segment.end = update.end;
         }
       }
     });
+
+    // if we've buffered to the end of the video, let the MediaSource know
+    if (this.playlists.media().endList &&
+        currentBuffered.length &&
+        segments[segments.length - 1].end <= currentBuffered.end(0) &&
+        this.mediaSource.readyState === 'open') {
+      this.mediaSource.endOfStream();
+      return;
+    }
 
     if (timelineUpdates.length) {
       this.updateDuration(playlist);
@@ -4217,6 +4213,8 @@ videojs.Hls.prototype.setCurrentTime = function(currentTime) {
   if (buffered && buffered.length) {
     return currentTime;
   }
+
+  this.lastSegmentLoaded_ = null;
 
   // cancel outstanding requests and buffer appends
   this.cancelSegmentXhr();
