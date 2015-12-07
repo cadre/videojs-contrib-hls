@@ -134,11 +134,6 @@ var
       type: 'sourceopen',
       swfId: player.tech_.el().id
     });
-
-    // endOfStream triggers an exception if flash isn't available
-    player.tech_.hls.mediaSource.endOfStream = function(error) {
-      this.error_ = error;
-    };
   },
   standardXHRResponse = function(request) {
     if (!request.url) {
@@ -170,6 +165,11 @@ var
   // a no-op MediaSource implementation to allow synchronous testing
   MockMediaSource = videojs.extend(videojs.EventTarget, {
     constructor: function() {},
+    duration: NaN,
+    seekable: videojs.createTimeRange(),
+    addSeekableRange_: function(start, end) {
+      this.seekable = videojs.createTimeRange(start, end);
+    },
     addSourceBuffer: function() {
       return new (videojs.extend(videojs.EventTarget, {
         constructor: function() {},
@@ -179,7 +179,10 @@ var
         remove: function() {}
       }))();
     },
-    endOfStream: function() {}
+    // endOfStream triggers an exception if flash isn't available
+    endOfStream: function(error) {
+      this.error_ = error;
+    }
   }),
 
   // do a shallow copy of the properties of source onto the target object
@@ -546,11 +549,11 @@ test('finds the correct buffered region based on currentTime', function() {
   standardXHRResponse(requests[1]);
   player.currentTime(3);
   clock.tick(1);
-  equal(player.tech_.hls.findCurrentBuffered_().end(0),
+  equal(player.tech_.hls.findBufferedRange_().end(0),
         5, 'inside the first buffered region');
   player.currentTime(6);
   clock.tick(1);
-  equal(player.tech_.hls.findCurrentBuffered_().end(0),
+  equal(player.tech_.hls.findBufferedRange_().end(0),
         12, 'inside the second buffered region');
 });
 
@@ -735,8 +738,8 @@ test('buffer checks are noops when only the master is ready', function() {
     type: 'application/vnd.apple.mpegurl'
   });
   openMediaSource(player);
-  standardXHRResponse(requests.shift());
-  standardXHRResponse(requests.shift());
+  standardXHRResponse(requests.shift()); // master
+  standardXHRResponse(requests.shift()); // media
   // ignore any outstanding segment requests
   requests.length = 0;
 
@@ -749,7 +752,8 @@ test('buffer checks are noops when only the master is ready', function() {
   openMediaSource(player);
 
   // respond with the master playlist but don't send the media playlist yet
-  standardXHRResponse(requests.shift());
+  player.tech_.hls.bandwidth = 1; // force media1 to be requested
+  standardXHRResponse(requests.shift()); // master
   // trigger fillBuffer()
   player.tech_.hls.checkBuffer_();
 
@@ -826,21 +830,6 @@ test('selects a playlist after segment downloads', function() {
   standardXHRResponse(requests[3]);
 
   strictEqual(calls, 3, 'selects after additional segments');
-});
-
-test('reports an error if a segment is unreachable', function() {
-  player.src({
-    src: 'manifest/master.m3u8',
-    type: 'application/vnd.apple.mpegurl'
-  });
-  openMediaSource(player);
-
-  player.tech_.hls.bandwidth = 20000;
-  standardXHRResponse(requests[0]); // master
-  standardXHRResponse(requests[1]); // media
-
-  requests[2].respond(400); // segment
-  strictEqual(player.tech_.hls.mediaSource.error_, 'network', 'network error is triggered');
 });
 
 test('updates the duration after switching playlists', function() {
@@ -996,7 +985,7 @@ test('uses the lowest bitrate if no other is suitable', function() {
               'the lowest bitrate stream is selected');
 });
 
-  test('selects the correct rendition by player dimensions', function() {
+test('selects the correct rendition by player dimensions', function() {
   var playlist;
 
   player.src({
@@ -1066,6 +1055,174 @@ test('selects the highest bitrate playlist when the player dimensions are ' +
   equal(playlist.attributes.BANDWIDTH,
         1000,
         'selected the highest bandwidth variant');
+});
+
+test('filters playlists that are currently excluded', function() {
+  var playlist;
+  player.src({
+    src: 'manifest/master.m3u8',
+    type: 'application/vnd.apple.mpegurl'
+  });
+  openMediaSource(player);
+
+  player.tech_.hls.bandwidth = 1e10;
+  requests.shift().respond(200, null,
+                           '#EXTM3U\n' +
+                           '#EXT-X-STREAM-INF:BANDWIDTH=1000\n' +
+                           'media.m3u8\n' +
+                           '#EXT-X-STREAM-INF:BANDWIDTH=1\n' +
+                           'media1.m3u8\n'); // master
+  standardXHRResponse(requests.shift()); // media
+
+  // exclude the current playlist
+  player.tech_.hls.playlists.master.playlists[0].excludeUntil = +new Date() + 1000;
+  playlist = player.tech_.hls.selectPlaylist();
+  equal(playlist, player.tech_.hls.playlists.master.playlists[1], 'respected exclusions');
+
+  // timeout the exclusion
+  clock.tick(1000);
+  playlist = player.tech_.hls.selectPlaylist();
+  equal(playlist, player.tech_.hls.playlists.master.playlists[0], 'expired the exclusion');
+});
+
+test('blacklists switching from video+audio playlists to audio only', function() {
+  var audioPlaylist;
+  player.src({
+    src: 'manifest/master.m3u8',
+    type: 'application/vnd.apple.mpegurl'
+  });
+  openMediaSource(player);
+
+  player.tech_.hls.bandwidth = 1e10;
+  requests.shift().respond(200, null,
+                           '#EXTM3U\n' +
+                           '#EXT-X-STREAM-INF:BANDWIDTH=1,CODECS="mp4a.40.2"\n' +
+                           'media.m3u8\n' +
+                           '#EXT-X-STREAM-INF:BANDWIDTH=10,RESOLUTION=1x1\n' +
+                           'media1.m3u8\n'); // master
+
+  standardXHRResponse(requests.shift()); // media1
+  equal(player.tech_.hls.playlists.media(),
+        player.tech_.hls.playlists.master.playlists[1],
+        'selected video+audio');
+  audioPlaylist = player.tech_.hls.playlists.master.playlists[0];
+  equal(audioPlaylist.excludeUntil, Infinity, 'excluded incompatible playlist');
+});
+
+test('blacklists switching from audio-only playlists to video+audio', function() {
+  var videoAudioPlaylist;
+  player.src({
+    src: 'manifest/master.m3u8',
+    type: 'application/vnd.apple.mpegurl'
+  });
+  openMediaSource(player);
+
+  player.tech_.hls.bandwidth = 1;
+  requests.shift().respond(200, null,
+                           '#EXTM3U\n' +
+                           '#EXT-X-STREAM-INF:BANDWIDTH=1,CODECS="mp4a.40.2"\n' +
+                           'media.m3u8\n' +
+                           '#EXT-X-STREAM-INF:BANDWIDTH=10,RESOLUTION=1x1\n' +
+                           'media1.m3u8\n'); // master
+
+  standardXHRResponse(requests.shift()); // media1
+  equal(player.tech_.hls.playlists.media(),
+        player.tech_.hls.playlists.master.playlists[0],
+        'selected audio only');
+  videoAudioPlaylist = player.tech_.hls.playlists.master.playlists[1];
+  equal(videoAudioPlaylist.excludeUntil, Infinity, 'excluded incompatible playlist');
+});
+
+test('blacklists switching from video-only playlists to video+audio', function() {
+  var videoAudioPlaylist;
+  player.src({
+    src: 'manifest/master.m3u8',
+    type: 'application/vnd.apple.mpegurl'
+  });
+  openMediaSource(player);
+
+  player.tech_.hls.bandwidth = 1;
+  requests.shift().respond(200, null,
+                           '#EXTM3U\n' +
+                           '#EXT-X-STREAM-INF:BANDWIDTH=1,CODECS="avc1.4d400d"\n' +
+                           'media.m3u8\n' +
+                           '#EXT-X-STREAM-INF:BANDWIDTH=10,CODECS="avc1.4d400d,mp4a.40.2"\n' +
+                           'media1.m3u8\n'); // master
+
+  standardXHRResponse(requests.shift()); // media
+  equal(player.tech_.hls.playlists.media(),
+        player.tech_.hls.playlists.master.playlists[0],
+        'selected video only');
+  videoAudioPlaylist = player.tech_.hls.playlists.master.playlists[1];
+  equal(videoAudioPlaylist.excludeUntil, Infinity, 'excluded incompatible playlist');
+});
+
+test('does not blacklist compatible H.264 codec strings', function() {
+  var master;
+  player.src({
+    src: 'manifest/master.m3u8',
+    type: 'application/vnd.apple.mpegurl'
+  });
+  openMediaSource(player);
+
+  player.tech_.hls.bandwidth = 1;
+  requests.shift().respond(200, null,
+                           '#EXTM3U\n' +
+                           '#EXT-X-STREAM-INF:BANDWIDTH=1,CODECS="avc1.4d400d,mp4a.40.5"\n' +
+                           'media.m3u8\n' +
+                           '#EXT-X-STREAM-INF:BANDWIDTH=10,CODECS="avc1.4d400f,mp4a.40.5"\n' +
+                           'media1.m3u8\n'); // master
+
+  standardXHRResponse(requests.shift()); // media
+  master = player.tech_.hls.playlists.master;
+  strictEqual(master.playlists[0].excludeUntil, undefined, 'did not blacklist');
+  strictEqual(master.playlists[1].excludeUntil, undefined, 'did not blacklist');
+});
+
+test('does not blacklist compatible AAC codec strings', function() {
+  var master;
+  player.src({
+    src: 'manifest/master.m3u8',
+    type: 'application/vnd.apple.mpegurl'
+  });
+  openMediaSource(player);
+
+  player.tech_.hls.bandwidth = 1;
+  requests.shift().respond(200, null,
+                           '#EXTM3U\n' +
+                           '#EXT-X-STREAM-INF:BANDWIDTH=1,CODECS="avc1.4d400d,mp4a.40.2"\n' +
+                           'media.m3u8\n' +
+                           '#EXT-X-STREAM-INF:BANDWIDTH=10,CODECS="avc1.4d400d,mp4a.40.3"\n' +
+                           'media1.m3u8\n'); // master
+
+  standardXHRResponse(requests.shift()); // media
+  master = player.tech_.hls.playlists.master;
+  strictEqual(master.playlists[0].excludeUntil, undefined, 'did not blacklist');
+  strictEqual(master.playlists[1].excludeUntil, undefined, 'did not blacklist');
+});
+
+test('blacklists switching between playlists with incompatible audio codecs', function() {
+  var alternatePlaylist;
+  player.src({
+    src: 'manifest/master.m3u8',
+    type: 'application/vnd.apple.mpegurl'
+  });
+  openMediaSource(player);
+
+  player.tech_.hls.bandwidth = 1;
+  requests.shift().respond(200, null,
+                           '#EXTM3U\n' +
+                           '#EXT-X-STREAM-INF:BANDWIDTH=1,CODECS="avc1.4d400d,mp4a.40.5"\n' +
+                           'media.m3u8\n' +
+                           '#EXT-X-STREAM-INF:BANDWIDTH=10,CODECS="avc1.4d400d,mp4a.40.2"\n' +
+                           'media1.m3u8\n'); // master
+
+  standardXHRResponse(requests.shift()); // media
+  equal(player.tech_.hls.playlists.media(),
+        player.tech_.hls.playlists.master.playlists[0],
+        'selected HE-AAC stream');
+  alternatePlaylist = player.tech_.hls.playlists.master.playlists[1];
+  equal(alternatePlaylist.excludeUntil, Infinity, 'excluded incompatible playlist');
 });
 
 test('does not download the next segment if the buffer is full', function() {
@@ -1180,16 +1337,24 @@ test('only makes one segment request at a time', function() {
 });
 
 test('only appends one segment at a time', function() {
+  var appends = 0;
   player.src({
     src: 'manifest/media.m3u8',
     type: 'application/vnd.apple.mpegurl'
   });
   openMediaSource(player);
   standardXHRResponse(requests.pop()); // media.m3u8
+  player.tech_.hls.sourceBuffer.appendBuffer = function() {
+    appends++;
+  };
+
   standardXHRResponse(requests.pop()); // segment 0
 
   player.tech_.hls.checkBuffer_();
   equal(requests.length, 0, 'did not request while updating');
+
+  player.tech_.hls.checkBuffer_();
+  equal(appends, 1, 'appended once');
 });
 
 test('waits to download new segments until the media playlist is stable', function() {
@@ -1198,8 +1363,8 @@ test('waits to download new segments until the media playlist is stable', functi
     type: 'application/vnd.apple.mpegurl'
   });
   openMediaSource(player);
-  standardXHRResponse(requests.shift()); // master
   player.tech_.hls.bandwidth = 1; // make sure we stay on the lowest variant
+  standardXHRResponse(requests.shift()); // master
   standardXHRResponse(requests.shift()); // media1
 
   // force a playlist switch
@@ -1331,32 +1496,50 @@ test('playlist 404 should end stream with a network error', function() {
   equal(player.tech_.hls.mediaSource.error_, 'network', 'set a network error');
 });
 
-test('segment 404 should trigger MEDIA_ERR_NETWORK', function () {
+test('segment 404 should trigger blacklisting of media', function () {
+  var media;
+
   player.src({
-    src: 'manifest/media.m3u8',
+    src: 'manifest/master.m3u8',
     type: 'application/vnd.apple.mpegurl'
   });
-
   openMediaSource(player);
 
-  standardXHRResponse(requests[0]);
-  requests[1].respond(404);
-  ok(player.tech_.hls.error.message, 'an error message is available');
-  equal(2, player.tech_.hls.error.code, 'Player error code should be set to MediaError.MEDIA_ERR_NETWORK');
+  player.tech_.hls.bandwidth = 20000;
+  standardXHRResponse(requests[0]); // master
+  standardXHRResponse(requests[1]); // media
+
+  media = player.tech_.hls.playlists.media_;
+
+  requests[2].respond(400); // segment
+  ok(media.excludeUntil > 0, 'original media blacklisted for some time');
 });
 
-test('segment 500 should trigger MEDIA_ERR_ABORTED', function () {
+test('playlist 404 should blacklist media', function () {
+  var media, url;
+
   player.src({
-    src: 'manifest/media.m3u8',
+    src: 'manifest/master.m3u8',
     type: 'application/vnd.apple.mpegurl'
   });
-
   openMediaSource(player);
 
-  standardXHRResponse(requests[0]);
-  requests[1].respond(500);
-  ok(player.tech_.hls.error.message, 'an error message is available');
-  equal(4, player.tech_.hls.error.code, 'Player error code should be set to MediaError.MEDIA_ERR_ABORTED');
+  player.tech_.hls.bandwidth = 1e10;
+  requests[0].respond(200, null,
+                           '#EXTM3U\n' +
+                           '#EXT-X-STREAM-INF:BANDWIDTH=1000\n' +
+                           'media.m3u8\n' +
+                           '#EXT-X-STREAM-INF:BANDWIDTH=1\n' +
+                           'media1.m3u8\n'); // master
+
+  equal(player.tech_.hls.playlists.media_, undefined, 'no media is initially set');
+
+  requests[1].respond(400); // media
+
+  url = requests[1].url.slice(requests[1].url.lastIndexOf('/') + 1);
+  media = player.tech_.hls.playlists.master.playlists[url];
+
+  ok(media.excludeUntil > 0, 'original media blacklisted for some time');
 });
 
 test('seeking in an empty playlist is a non-erroring noop', function() {
@@ -1377,7 +1560,7 @@ test('seeking in an empty playlist is a non-erroring noop', function() {
   equal(requests.length, requestsLength, 'made no additional requests');
 });
 
-test('tech\'s duration reports Infinity for live playlists', function() {
+test('sets seekable and duration for live playlists', function() {
   player.src({
     src: 'http://example.com/manifest/missingEndlist.m3u8',
     type: 'application/vnd.apple.mpegurl'
@@ -1386,13 +1569,19 @@ test('tech\'s duration reports Infinity for live playlists', function() {
 
   standardXHRResponse(requests[0]);
 
-  strictEqual(player.tech_.duration(),
-              Infinity,
-              'duration on the tech is infinity');
+  equal(player.tech_.hls.mediaSource.seekable.length,
+        1,
+        'set one seekable range');
+  equal(player.tech_.hls.mediaSource.seekable.start(0),
+        player.tech_.hls.seekable().start(0),
+        'set seekable start');
+  equal(player.tech_.hls.mediaSource.seekable.end(0),
+        player.tech_.hls.seekable().end(0),
+        'set seekable end');
 
-  notEqual(player.tech_.hls.mediaSource.duration,
+  strictEqual(player.tech_.hls.mediaSource.duration,
               Infinity,
-              'duration on the mediaSource is not infinity');
+              'duration on the mediaSource is infinity');
 });
 
 test('live playlist starts three target durations before live', function() {
@@ -1445,6 +1634,41 @@ test('live playlist starts with correct currentTime value', function() {
   strictEqual(player.currentTime(),
               videojs.Hls.Playlist.seekable(player.tech_.hls.playlists.media()).end(0),
               'currentTime is updated at playback');
+});
+
+test('adjusts the seekable start based on the amount of expired live content', function() {
+  player.src({
+    src: 'http://example.com/manifest/liveStart30sBefore.m3u8',
+    type: 'application/vnd.apple.mpegurl'
+  });
+  openMediaSource(player);
+
+  standardXHRResponse(requests.shift());
+
+  // add timeline info to the playlist
+  player.tech_.hls.playlists.media().segments[1].end = 29.5;
+  // expired_ should be ignored if there is timeline information on
+  // the playlist
+  player.tech_.hls.playlists.expired_ = 172;
+
+  equal(player.seekable().start(0),
+        29.5 - 29,
+        'offset the seekable start');
+});
+
+test('estimates seekable ranges for live streams that have been paused for a long time', function() {
+  player.src({
+    src: 'http://example.com/manifest/liveStart30sBefore.m3u8',
+    type: 'application/vnd.apple.mpegurl'
+  });
+  openMediaSource(player);
+
+  standardXHRResponse(requests.shift());
+  player.tech_.hls.playlists.expired_ = 172;
+
+  equal(player.seekable().start(0),
+        player.tech_.hls.playlists.expired_,
+        'offset the seekable start');
 });
 
 test('resets the time to a seekable position when resuming a live stream ' +
@@ -1518,6 +1742,7 @@ test('reloads out-of-date live playlists when switching variants', function() {
 });
 
 test('if withCredentials global option is used, withCredentials is set on the XHR object', function() {
+  var hlsOptions = videojs.options.hls;
   player.dispose();
   videojs.options.hls = {
     withCredentials: true
@@ -1530,6 +1755,7 @@ test('if withCredentials global option is used, withCredentials is set on the XH
   openMediaSource(player);
   ok(requests[0].withCredentials,
      'with credentials should be set to true if that option is passed in');
+  videojs.options.hls = hlsOptions;
 });
 
 test('if withCredentials src option is used, withCredentials is set on the XHR object', function() {
@@ -1898,13 +2124,17 @@ test('the source handler supports HLS mime types', function() {
     ok(videojs.HlsSourceHandler(techName).canHandleSource({
       type: 'aPplicatiOn/VnD.aPPle.MpEgUrL'
     }), 'supports vnd.apple.mpegurl');
+    ok(videojs.HlsSourceHandler(techName).canPlayType('aPplicatiOn/VnD.aPPle.MpEgUrL'), 'supports vnd.apple.mpegurl');
+    ok(videojs.HlsSourceHandler(techName).canPlayType('aPplicatiOn/x-MPegUrl'), 'supports x-mpegurl');
 
     ok(!(videojs.HlsSourceHandler(techName).canHandleSource({
       type: 'video/mp4'
-    }) instanceof videojs.Hls), 'does not support mp4');
+    }) instanceof videojs.HlsHandler), 'does not support mp4');
     ok(!(videojs.HlsSourceHandler(techName).canHandleSource({
       type: 'video/x-flv'
-    }) instanceof videojs.Hls), 'does not support flv');
+    }) instanceof videojs.HlsHandler), 'does not support flv');
+    ok(!(videojs.HlsSourceHandler(techName).canPlayType('video/mp4')), 'does not support mp4');
+    ok(!(videojs.HlsSourceHandler(techName).canPlayType('video/x-flv')), 'does not support flv');
   });
 });
 
@@ -2267,8 +2497,8 @@ test('retries key requests once upon failure', function() {
   equal(requests.length, 2, 'gives up after one retry');
 });
 
-test('errors if key requests fail more than once', function() {
-  var bytes = [];
+test('blacklists playlist if key requests fail more than once', function() {
+  var bytes = [], media;
 
   player.src({
     src: 'https://example.com/encrypted-media.m3u8',
@@ -2288,14 +2518,16 @@ test('errors if key requests fail more than once', function() {
   player.tech_.hls.sourceBuffer.appendBuffer = function(chunk) {
     bytes.push(chunk);
   };
+
+  media = player.tech_.hls.playlists.media_;
+
   standardXHRResponse(requests.pop()); // segment 1
   requests.shift().respond(404); // fail key
   requests.shift().respond(404); // fail key, again
   player.tech_.hls.checkBuffer_();
 
-  equal(player.tech_.hls.mediaSource.error_,
-        'network',
-        'triggered a network error');
+  ok(media.excludeUntil > 0,
+        'playlist blacklisted');
 });
 
 test('the key is supplied to the decrypter in the correct format', function() {
@@ -2433,8 +2665,9 @@ test('resolves relative key URLs against the playlist', function() {
   equal(requests[0].url, 'https://example.com/key.php?r=52', 'resolves the key URL');
 });
 
-test('treats invalid keys as a key request failure', function() {
-  var bytes = [];
+test('treats invalid keys as a key request failure and blacklists playlist', function() {
+  var bytes = [], media;
+
   player.src({
     src: 'https://example.com/media.m3u8',
     type: 'application/vnd.apple.mpegurl'
@@ -2453,6 +2686,8 @@ test('treats invalid keys as a key request failure', function() {
   player.tech_.hls.sourceBuffer.appendBuffer = function(chunk) {
     bytes.push(chunk);
   };
+
+  media = player.tech_.hls.playlists.media_;
   // segment request
   standardXHRResponse(requests.pop());
   // keys should be 16 bytes long
@@ -2466,10 +2701,9 @@ test('treats invalid keys as a key request failure', function() {
   requests.shift().respond(200, null, '');
   player.tech_.hls.checkBuffer_();
 
-  // two failed attempts is a network error
-  equal(player.tech_.hls.mediaSource.error_,
-        'network',
-        'triggered a network error');
+  // two failed attempts is an error - blacklist this playlist
+  ok(media.excludeUntil > 0,
+        'blacklisted playlist');
 });
 
 test('live stream should not call endOfStream', function(){
